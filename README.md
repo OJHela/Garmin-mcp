@@ -2,6 +2,8 @@
 
 # Garmin MCP Server
 
+> **Railway deployment:** this is a copy of [taxuspt/garmin_mcp](https://github.com/taxuspt/garmin_mcp) with Railway hosting support. See [RAILWAY.md](RAILWAY.md).
+
 This Model Context Protocol (MCP) server connects to Garmin Connect and exposes your fitness and health data to Claude and other MCP-compatible clients.
 
 Garmin's API is accessed via the awesome [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) library.

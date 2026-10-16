@@ -425,7 +425,8 @@ def _parse_transport_config() -> tuple[str, str, int]:
     # so a 0.0.0.0 default would expose full read/write access to the user's
     # Garmin account to the whole network. Opt in explicitly with GARMIN_MCP_HOST.
     http_host = os.getenv("GARMIN_MCP_HOST", "127.0.0.1")
-    http_port = int(os.getenv("GARMIN_MCP_PORT", "8000"))
+    # Fall back to $PORT, which PaaS hosts such as Railway inject.
+    http_port = int(os.getenv("GARMIN_MCP_PORT") or os.getenv("PORT") or "8000")
     return transport, http_host, http_port
 
 
@@ -517,8 +518,72 @@ class _ToolFilter:
 # ---------------------------------------------------------------------------
 
 
+def _bootstrap_tokens_from_env():
+    """Write tokens from GARMIN_TOKENS_BASE64 into the token directory.
+
+    Hosted deployments (e.g. Railway) have no terminal for the MFA prompt, so
+    tokens are generated locally with ``garmin-mcp-auth`` and passed in as the
+    contents of ``~/.garminconnect_base64``. Existing tokens on disk win: they
+    may have been refreshed since the env var was set.
+    """
+    raw = os.getenv("GARMIN_TOKENS_BASE64", "").strip()
+    if not raw:
+        return
+    token_json_path = os.path.join(tokenstore, "garmin_tokens.json")
+    if os.path.exists(token_json_path):
+        return
+    try:
+        token_data = base64.b64decode(raw).decode()
+    except (ValueError, UnicodeDecodeError):
+        print("GARMIN_TOKENS_BASE64 is not valid base64; ignoring it.", file=sys.stderr)
+        return
+    os.makedirs(tokenstore, exist_ok=True)
+    with open(token_json_path, "w") as f:
+        f.write(token_data)
+    token_utils.secure_token_dir(tokenstore)
+    print(f"Wrote tokens from GARMIN_TOKENS_BASE64 to '{tokenstore}'.", file=sys.stderr)
+
+
+class _BearerAuthMiddleware:
+    """ASGI middleware requiring a shared secret on every HTTP request.
+
+    Accepts ``Authorization: Bearer <token>`` or a ``?key=<token>`` query
+    parameter (for clients such as claude.ai connectors that cannot set
+    headers). ``/healthz`` and ``/readyz`` stay open for platform probes.
+    """
+
+    _OPEN_PATHS = ("/healthz", "/readyz")
+
+    def __init__(self, app, token):
+        self._app = app
+        self._token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path") in self._OPEN_PATHS:
+            return await self._app(scope, receive, send)
+
+        import hmac
+        from urllib.parse import parse_qs
+
+        headers = dict(scope.get("headers") or [])
+        auth = headers.get(b"authorization", b"").decode("latin-1")
+        supplied = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not supplied:
+            query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+            supplied = (query.get("key") or [""])[0]
+        if supplied and hmac.compare_digest(supplied.encode(), self._token.encode()):
+            return await self._app(scope, receive, send)
+
+        from starlette.responses import JSONResponse
+
+        response = JSONResponse({"error": "unauthorized"}, status_code=401)
+        await response(scope, receive, send)
+
+
 def init_api(email, password):
     """Initialize Garmin API with your credentials."""
+
+    _bootstrap_tokens_from_env()
 
     # Claude Desktop may leave blank optional user_config values as literal
     # placeholders. Do not mistake those strings for credentials and trigger a
@@ -798,7 +863,31 @@ def main():
             file=sys.stderr,
         )
 
-    # Run the MCP server
+    # Run the MCP server. With MCP_AUTH_TOKEN set, HTTP transports are served
+    # through a bearer-token check so the endpoint can be exposed publicly.
+    auth_token = os.getenv("MCP_AUTH_TOKEN", "").strip()
+    if transport != "stdio" and auth_token:
+        import uvicorn
+
+        asgi_app = (
+            fastmcp.streamable_http_app()
+            if transport == "streamable-http"
+            else fastmcp.sse_app()
+        )
+        print("HTTP endpoint protected by MCP_AUTH_TOKEN.", file=sys.stderr)
+        uvicorn.run(
+            _BearerAuthMiddleware(asgi_app, auth_token),
+            host=http_host,
+            port=http_port,
+            log_level="info",
+        )
+        return
+    if transport != "stdio" and http_host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            "WARNING: serving over HTTP on a non-loopback address without "
+            "MCP_AUTH_TOKEN; anyone who can reach it can use your Garmin account.",
+            file=sys.stderr,
+        )
     app.run(transport=transport)
 
 

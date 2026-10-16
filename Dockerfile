@@ -30,9 +30,13 @@ COPY pytest.ini ./
 RUN mkdir -p /root/.garminconnect && \
     chmod 700 /root/.garminconnect
 
-# Expose the HTTP port. The image defaults to stdio (Claude Desktop, Inspector);
-# set GARMIN_MCP_TRANSPORT=streamable-http to serve over this port (e.g. in k8s).
-# EXPOSE 8000
+# Serve over HTTP by default (Railway). The port comes from $PORT, which
+# Railway injects; GARMIN_MCP_PORT overrides it. Set GARMIN_MCP_TRANSPORT=stdio
+# to get the original stdio behaviour (Claude Desktop, Inspector).
+ENV GARMIN_MCP_TRANSPORT=streamable-http \
+    GARMIN_MCP_HOST=0.0.0.0 \
+    GARMIN_MCP_STATELESS_HTTP=true
+EXPOSE 8000
 
 # Set the entrypoint to run the MCP server
 ENTRYPOINT ["garmin-mcp"]
