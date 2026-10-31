@@ -178,7 +178,8 @@ class _GarminProxy:
     _MESSAGES = {
         GarminConnectAuthenticationError: (
             "Garmin authentication failed",
-            "Re-run 'garmin-mcp-auth' to refresh your tokens and restart the server.",
+            "Re-run 'garmin-mcp-auth' to refresh your tokens and restart the server, "
+            "or log in again with the garmin_login tool.",
         ),
         GarminConnectTooManyRequestsError: (
             "Garmin rate limit hit",
@@ -348,8 +349,8 @@ class _PendingGarminClient:
                 if client is None:
                     self._login_error = RuntimeError(
                         "Garmin login failed. Run 'garmin-mcp-auth' to "
-                        "authenticate, then restart the server. On a hosted "
-                        "server, log in from the /login page instead."
+                        "authenticate, then restart the server, or call the "
+                        "garmin_login tool."
                     )
                     print(
                         "Garmin Connect client failed to initialize (see "
@@ -854,36 +855,10 @@ def main():
 
     auth_token = os.getenv("MCP_AUTH_TOKEN", "").strip()
 
-    from mcp.types import ToolAnnotations
+    # Login tools, so a hosted server can be logged in from the MCP client.
+    from garmin_mcp import web_login
 
-    @app.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
-    async def garmin_login_status() -> str:
-        """Report whether the server is logged in to Garmin Connect.
-
-        If it is not, the user can log in from the server's /login page in a
-        browser (append ?key=<MCP_AUTH_TOKEN>). Never ask the user for their
-        Garmin password in chat; send them to that page instead.
-        """
-        import json
-
-        public_url = os.getenv("GARMIN_MCP_PUBLIC_URL", "").rstrip("/")
-        if not public_url and os.getenv("RAILWAY_PUBLIC_DOMAIN"):
-            public_url = "https://" + os.getenv("RAILWAY_PUBLIC_DOMAIN")
-        login_available = transport != "stdio" and bool(auth_token)
-        return json.dumps({
-            "status": pending_client.login_state(),
-            "login_url": (
-                f"{public_url}/login?key=<MCP_AUTH_TOKEN>"
-                if login_available and public_url
-                else "/login?key=<MCP_AUTH_TOKEN>" if login_available else None
-            ),
-            "hint": (
-                "Open login_url in a browser and enter your Garmin email, "
-                "password and MFA code there."
-                if login_available
-                else "Run 'garmin-mcp-auth' on this machine and restart the server."
-            ),
-        })
+    web_login.register_login_tools(app, pending_client, tokenstore, is_cn)
 
     # When serving over HTTP, expose liveness/readiness endpoints for k8s probes.
     # The MCP endpoint itself requires a handshake and isn't probe-friendly.
@@ -905,8 +880,6 @@ def main():
         # Browser login page. Only with MCP_AUTH_TOKEN: without it anyone who
         # can reach the server could replace the Garmin account behind it.
         if auth_token:
-            from garmin_mcp import web_login
-
             web_login.register_login_routes(fastmcp, pending_client, tokenstore, is_cn)
             print("Garmin login page available at /login?key=<MCP_AUTH_TOKEN>.", file=sys.stderr)
 

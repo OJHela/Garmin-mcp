@@ -7,13 +7,29 @@ Tämä repo on kopio projektista [taxuspt/garmin_mcp](https://github.com/taxuspt
   ja kuuntelee Railwayn antamaa `$PORT`-porttia.
 - `MCP_AUTH_TOKEN` suojaa endpointin: pyynnöissä pitää olla
   `Authorization: Bearer <token>` tai `?key=<token>` URL:ssa.
-- **Kirjautumissivu `/login`**: kirjaudut Garmin-tilillesi selaimessa
-  (sähköposti, salasana ja MFA-koodi). Mitään ei tarvitse ajaa omalla koneella.
-- MCP-työkalu `garmin_login_status` kertoo, onko palvelin kirjautunut, ja antaa
-  kirjautumissivun osoitteen.
+- **Kirjautuminen MCP:n kautta**: sano Claudelle esim. "kirjaudu Garminiin".
+  Claude kysyy sähköpostin, salasanan ja tarvittaessa vahvistuskoodin ja
+  kutsuu työkaluja `garmin_login` ja `garmin_submit_mfa_code`. Railwayssä ei
+  tarvitse tehdä mitään. `garmin_login_status` kertoo, onko palvelin kirjautunut.
+- Kirjautumissivu `/login` selaimessa (vain kun `MCP_AUTH_TOKEN` on asetettu).
 - `railway.json` määrittää Dockerfile-buildin ja `/healthz`-healthcheckin.
 
-## 1. Railwayn asetukset
+## Pikaohje: kirjautuminen ilman Railway-asetuksia
+
+1. Yhdistä MCP sovellukseesi osoitteella `https://<domain>/mcp`.
+2. Pyydä Claudea kirjautumaan Garminiin ja anna sille sähköposti, salasana ja
+   Garminin lähettämä vahvistuskoodi.
+
+Salasanaa ei tallenneta, vain kirjautumistokenit (voimassa noin 6 kk). Huomaa:
+
+- Ilman Volumea tokenit katoavat, kun Railway käynnistää palvelun uudelleen
+  (esim. uusi deploy). Silloin Claude pyytää kirjautumaan uudelleen.
+- Salasana kulkee keskustelun kautta, joten se jää keskusteluhistoriaan.
+- Ilman `MCP_AUTH_TOKEN`-muuttujaa kuka tahansa, joka tietää palvelun
+  osoitteen, voi käyttää kirjautunutta Garmin-tiliäsi. Suojaus vaatii alla
+  olevat Railway-asetukset.
+
+## 1. Railwayn asetukset (suositeltu suojaus)
 
 1. **Variables**-välilehdelle:
 

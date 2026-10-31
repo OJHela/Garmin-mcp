@@ -1,18 +1,20 @@
-"""Browser-based Garmin login for hosted (HTTP) deployments.
+"""Garmin login for hosted (HTTP) deployments, without a terminal.
 
 On a host such as Railway there is no terminal for ``garmin-mcp-auth`` and its
-MFA prompt. This module serves ``/login``: a small form for the Garmin email
-and password, then the MFA code if Garmin asks for one. On success the tokens
+MFA prompt. This module offers two ways in, both ending the same way: tokens
 are saved to the token directory and the running server switches to the new
 client, so no restart is needed.
 
-The page sits behind the same ``MCP_AUTH_TOKEN`` check as ``/mcp``; open it as
-``/login?key=<MCP_AUTH_TOKEN>``. The key stays in the form URLs so every step
-passes that check.
+- MCP tools ``garmin_login`` and ``garmin_submit_mfa_code``, so the user can
+  log in from their MCP client without touching the host.
+- A ``/login`` browser page (only with ``MCP_AUTH_TOKEN``), opened as
+  ``/login?key=<MCP_AUTH_TOKEN>``. The key stays in the form URLs so every
+  step passes the same check as ``/mcp``.
 """
 
 import base64
 import html
+import json
 import os
 import secrets
 import sys
@@ -138,22 +140,40 @@ def _error_text(err):
     return f"Kirjautuminen epäonnistui: {msg.split(':')[0] or name}"
 
 
+def start_login(email, password, is_cn):
+    """Exchange credentials. Returns ``(garmin, client_state or None)``.
+
+    ``client_state`` is set when Garmin wants an MFA code; pass it with the
+    code to ``garmin.resume_login``.
+    """
+    garmin = Garmin(email=email, password=password, is_cn=is_cn, return_on_mfa=True)
+    result1, result2 = garmin.client.login(email, password, return_on_mfa=True)
+    return garmin, (result2 if result1 == "needs_mfa" else None)
+
+
+def finish_login(garmin, pending_client, tokenstore, is_cn):
+    """Save tokens, load a fully initialised client and swap it in.
+
+    Returns the tokens base64-encoded, the GARMIN_TOKENS_BASE64 format.
+    """
+    os.makedirs(tokenstore, exist_ok=True)
+    garmin.client.dump(tokenstore)
+    token_utils.secure_token_dir(tokenstore)
+    # The return_on_mfa login skips profile loading; log in again from the
+    # saved tokens, as init_api does, so display_name and units are set.
+    client = Garmin(is_cn=is_cn)
+    client.login(tokenstore)
+    pending_client.set_client(client)
+    with open(os.path.join(tokenstore, "garmin_tokens.json")) as f:
+        return base64.b64encode(f.read().encode()).decode()
+
+
 def register_login_routes(fastmcp, pending_client, tokenstore, is_cn):
     """Add ``/login`` routes to the FastMCP HTTP app."""
     from starlette.concurrency import run_in_threadpool
 
     def _finish(garmin):
-        """Save tokens, load a fully initialised client and swap it in."""
-        os.makedirs(tokenstore, exist_ok=True)
-        garmin.client.dump(tokenstore)
-        token_utils.secure_token_dir(tokenstore)
-        # The return_on_mfa login skips profile loading; log in again from the
-        # saved tokens, as init_api does, so display_name and units are set.
-        client = Garmin(is_cn=is_cn)
-        client.login(tokenstore)
-        pending_client.set_client(client)
-        with open(os.path.join(tokenstore, "garmin_tokens.json")) as f:
-            return base64.b64encode(f.read().encode()).decode()
+        return finish_login(garmin, pending_client, tokenstore, is_cn)
 
     @fastmcp.custom_route("/login", methods=["GET"])
     async def login_form(request):
@@ -168,17 +188,13 @@ def register_login_routes(fastmcp, pending_client, tokenstore, is_cn):
         if not email or not password:
             return _credentials_form(request, state, "Anna sähköposti ja salasana.")
 
-        def _login():
-            garmin = Garmin(email=email, password=password, is_cn=is_cn, return_on_mfa=True)
-            return garmin, garmin.client.login(email, password, return_on_mfa=True)
-
         try:
-            garmin, (result1, result2) = await run_in_threadpool(_login)
-            if result1 == "needs_mfa":
+            garmin, client_state = await run_in_threadpool(start_login, email, password, is_cn)
+            if client_state is not None:
                 _prune_expired()
                 nonce = secrets.token_urlsafe(24)
                 with _pending_lock:
-                    _pending_mfa[nonce] = (garmin, result2, time.monotonic() + _MFA_TTL_SECONDS)
+                    _pending_mfa[nonce] = (garmin, client_state, time.monotonic() + _MFA_TTL_SECONDS)
                 return _mfa_form(request, nonce)
             token_b64 = await run_in_threadpool(_finish, garmin)
         except Exception as err:  # noqa: BLE001 - shown to the user, not raised
@@ -213,3 +229,105 @@ def register_login_routes(fastmcp, pending_client, tokenstore, is_cn):
             _pending_mfa.pop(nonce, None)
         print("Web login succeeded; Garmin client replaced.", file=sys.stderr)
         return _success_page(token_b64)
+
+
+# The MCP tools serve one user, so one pending MFA login is enough; a new
+# garmin_login call replaces it.
+_TOOL_MFA_KEY = "__mcp_tool__"
+
+
+def register_login_tools(app, pending_client, tokenstore, is_cn):
+    """Add the garmin_login_status / garmin_login / garmin_submit_mfa_code tools."""
+    from mcp.types import ToolAnnotations
+    from starlette.concurrency import run_in_threadpool
+
+    def _result(status, message, **extra):
+        return json.dumps({"status": status, "message": message, **extra})
+
+    @app.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+    async def garmin_login_status() -> str:
+        """Report whether the server is logged in to Garmin Connect.
+
+        Call this first when a Garmin tool fails with a login error. If the
+        status is not "ready", ask the user for their Garmin Connect email and
+        password and call garmin_login.
+        """
+        state = pending_client.login_state()
+        if state == "ready":
+            return _result("ready", "Logged in to Garmin Connect.")
+        if state == "pending":
+            return _result("pending", "Login with saved tokens is still running; try again shortly.")
+        return _result(
+            "not_logged_in",
+            "Not logged in. Ask the user for their Garmin Connect email and "
+            "password, then call garmin_login.",
+        )
+
+    @app.tool(annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True,
+    ))
+    async def garmin_login(email: str, password: str) -> str:
+        """Log the server in to Garmin Connect with the user's credentials.
+
+        The password is used once to obtain login tokens and is not stored.
+        If the result status is "needs_mfa", ask the user for the code Garmin
+        just sent them and call garmin_submit_mfa_code. Tokens last about six
+        months; after that, log in again.
+
+        Args:
+            email: Garmin Connect account email
+            password: Garmin Connect account password
+        """
+        email = (email or "").strip()
+        if not email or not password:
+            return _result("error", "Email and password are required.")
+        try:
+            garmin, client_state = await run_in_threadpool(start_login, email, password, is_cn)
+            if client_state is not None:
+                _prune_expired()
+                with _pending_lock:
+                    _pending_mfa[_TOOL_MFA_KEY] = (
+                        garmin, client_state, time.monotonic() + _MFA_TTL_SECONDS,
+                    )
+                return _result(
+                    "needs_mfa",
+                    "Garmin sent a verification code by email or SMS. Ask the "
+                    "user for it and call garmin_submit_mfa_code within 10 minutes.",
+                )
+            await run_in_threadpool(finish_login, garmin, pending_client, tokenstore, is_cn)
+        except Exception as err:  # noqa: BLE001 - reported to the caller
+            print(f"MCP login failed: {type(err).__name__}", file=sys.stderr)
+            return _result("error", _error_text(err))
+        print("MCP login succeeded; Garmin client replaced.", file=sys.stderr)
+        return _result("ready", "Logged in to Garmin Connect. Garmin tools work now.")
+
+    @app.tool(annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True,
+    ))
+    async def garmin_submit_mfa_code(code: str) -> str:
+        """Finish a Garmin login that returned "needs_mfa".
+
+        Args:
+            code: The verification code Garmin sent to the user
+        """
+        _prune_expired()
+        with _pending_lock:
+            pending = _pending_mfa.get(_TOOL_MFA_KEY)
+        if pending is None:
+            return _result("error", "No login is waiting for a code, or it expired. Call garmin_login again.")
+        code = (code or "").strip()
+        if not code:
+            return _result("error", "The verification code is required.")
+        garmin, client_state, _ = pending
+        try:
+            await run_in_threadpool(garmin.resume_login, client_state, code)
+            await run_in_threadpool(finish_login, garmin, pending_client, tokenstore, is_cn)
+        except Exception as err:  # noqa: BLE001 - reported to the caller
+            print(f"MCP login MFA step failed: {type(err).__name__}", file=sys.stderr)
+            return _result("error", _error_text(err))
+        with _pending_lock:
+            _pending_mfa.pop(_TOOL_MFA_KEY, None)
+        print("MCP login succeeded; Garmin client replaced.", file=sys.stderr)
+        return _result("ready", "Logged in to Garmin Connect. Garmin tools work now.")
+
+    return app
