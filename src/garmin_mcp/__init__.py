@@ -179,7 +179,8 @@ class _GarminProxy:
         GarminConnectAuthenticationError: (
             "Garmin authentication failed",
             "Re-run 'garmin-mcp-auth' to refresh your tokens and restart the server, "
-            "or log in again with the garmin_login tool.",
+            "or log in again with the garmin_login tool (with OAuth sign-in: "
+            "reconnect the connector).",
         ),
         GarminConnectTooManyRequestsError: (
             "Garmin rate limit hit",
@@ -465,6 +466,60 @@ def _resolve_stateless_http() -> bool:
     raise ValueError(
         f"Invalid GARMIN_MCP_STATELESS_HTTP {raw!r}; expected true or false"
     )
+
+
+def _resolve_oauth(transport) -> bool:
+    """Read GARMIN_MCP_OAUTH. OAuth sign-in needs the streamable-http transport."""
+    raw = os.getenv("GARMIN_MCP_OAUTH", "").strip().lower()
+    if raw in _FALSE_VALUES:
+        return False
+    if raw not in _TRUE_VALUES:
+        raise ValueError(f"Invalid GARMIN_MCP_OAUTH {raw!r}; expected true or false")
+    if transport != "streamable-http":
+        # The Docker image enables OAuth by default; stdio runs of the same
+        # image (docker-compose) simply don't use it.
+        print(
+            f"GARMIN_MCP_OAUTH ignored: it needs streamable-http, not {transport}.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _public_url(http_port) -> str:
+    """Public base URL: GARMIN_MCP_PUBLIC_URL, else Railway's domain, else localhost."""
+    url = os.getenv("GARMIN_MCP_PUBLIC_URL", "").strip().rstrip("/")
+    if url:
+        return url
+    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if domain:
+        return f"https://{domain}"
+    print(
+        "GARMIN_MCP_PUBLIC_URL not set; OAuth issuer defaults to localhost.",
+        file=sys.stderr,
+    )
+    return f"http://localhost:{http_port}"
+
+
+def _oauth_settings(provider, issuer_url) -> dict:
+    """FastMCP keyword arguments that turn on the OAuth authorization server."""
+    if provider is None:
+        return {}
+    from mcp.server.auth.settings import (
+        AuthSettings,
+        ClientRegistrationOptions,
+        RevocationOptions,
+    )
+
+    return {
+        "auth_server_provider": provider,
+        "auth": AuthSettings(
+            issuer_url=issuer_url,
+            resource_server_url=f"{issuer_url}/mcp",
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+            revocation_options=RevocationOptions(enabled=True),
+        ),
+    }
 
 
 class _ToolFilter:
@@ -770,6 +825,7 @@ def main():
         enabled_tools, disabled_tools = _resolve_tool_filters()
         transport, http_host, http_port = _parse_transport_config()
         stateless_http = _resolve_stateless_http()
+        oauth_enabled = _resolve_oauth(transport)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
@@ -781,8 +837,21 @@ def main():
     # failing well before a client's own initialize timeout would matter
     # again on a later call.
     pending_client = _PendingGarminClient(timeout=90.0)
-    pending_client.start(lambda: init_api(email, password))
-    garmin_client = _GarminProxy(pending_client)
+    if not oauth_enabled:
+        pending_client.start(lambda: init_api(email, password))
+    # With OAuth sign-in, each request uses the Garmin account of whoever
+    # signed in through the connector; see garmin_mcp.oauth.
+    oauth_provider = None
+    if oauth_enabled:
+        from garmin_mcp import oauth
+
+        issuer_url = _public_url(http_port)
+        oauth_provider = oauth.GarminOAuthProvider(
+            os.path.join(tokenstore, "oauth"), issuer_url, is_cn=is_cn
+        )
+        garmin_client = _GarminProxy(oauth.SessionClientRouter(oauth_provider, pending_client))
+    else:
+        garmin_client = _GarminProxy(pending_client)
 
     # Configure all modules with the Garmin client
     activity_management.configure(garmin_client)
@@ -809,6 +878,7 @@ def main():
         host=http_host,
         port=http_port,
         stateless_http=stateless_http,
+        **_oauth_settings(oauth_provider, issuer_url if oauth_enabled else None),
     )
     app = _ToolFilter(fastmcp, enabled_tools, disabled_tools)
     if enabled_tools:
@@ -858,7 +928,9 @@ def main():
     # Login tools, so a hosted server can be logged in from the MCP client.
     from garmin_mcp import web_login
 
-    web_login.register_login_tools(app, pending_client, tokenstore, is_cn)
+    # With OAuth the connector's sign-in window is the login; no tools needed.
+    if not oauth_enabled:
+        web_login.register_login_tools(app, pending_client, tokenstore, is_cn)
 
     # When serving over HTTP, expose liveness/readiness endpoints for k8s probes.
     # The MCP endpoint itself requires a handshake and isn't probe-friendly.
@@ -874,12 +946,18 @@ def main():
         # Readiness: Garmin login has succeeded, tool calls can work.
         @fastmcp.custom_route("/readyz", methods=["GET"])
         async def readyz(_request: "Request") -> "JSONResponse":
+            if oauth_enabled:
+                # Each user has their own Garmin session; the server is ready.
+                return JSONResponse({"status": "ready", "auth": "oauth"})
             status_code, body = _readiness(pending_client)
             return JSONResponse(body, status_code=status_code)
 
         # Browser login page. Only with MCP_AUTH_TOKEN: without it anyone who
         # can reach the server could replace the Garmin account behind it.
-        if auth_token:
+        if oauth_enabled:
+            oauth.register_oauth_routes(fastmcp, oauth_provider, is_cn)
+            print(f"OAuth sign-in enabled; issuer {issuer_url}.", file=sys.stderr)
+        elif auth_token:
             web_login.register_login_routes(fastmcp, pending_client, tokenstore, is_cn)
             print("Garmin login page available at /login?key=<MCP_AUTH_TOKEN>.", file=sys.stderr)
 
@@ -891,6 +969,17 @@ def main():
 
     # Run the MCP server. With MCP_AUTH_TOKEN set, HTTP transports are served
     # through a bearer-token check so the endpoint can be exposed publicly.
+    if oauth_enabled:
+        import uvicorn
+
+        uvicorn.run(
+            fastmcp.streamable_http_app(),
+            host=http_host,
+            port=http_port,
+            log_level="info",
+            access_log=False,
+        )
+        return
     if transport != "stdio" and auth_token:
         import uvicorn
 

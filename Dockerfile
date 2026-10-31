@@ -35,7 +35,8 @@ RUN mkdir -p /root/.garminconnect && \
 # to get the original stdio behaviour (Claude Desktop, Inspector).
 ENV GARMIN_MCP_TRANSPORT=streamable-http \
     GARMIN_MCP_HOST=0.0.0.0 \
-    GARMIN_MCP_STATELESS_HTTP=true
+    GARMIN_MCP_STATELESS_HTTP=true \
+    GARMIN_MCP_OAUTH=true
 EXPOSE 8000
 
 # Set the entrypoint to run the MCP server
