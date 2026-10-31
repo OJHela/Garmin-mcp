@@ -32,7 +32,7 @@ class _FakeGarmin:
         def _login(email, password, return_on_mfa=False):
             if password == "wrong":
                 raise garmin_mcp.GarminConnectAuthenticationError("401 Unauthorized")
-            return ("needs_mfa", {"s": 1}) if _FakeGarmin.needs_mfa else (None, None)
+            return ("needs_mfa", None) if _FakeGarmin.needs_mfa else (None, None)
 
         def _dump(path):
             with open(f"{path}/garmin_tokens.json", "w") as f:

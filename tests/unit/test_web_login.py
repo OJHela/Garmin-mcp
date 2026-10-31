@@ -27,7 +27,7 @@ class _FakeGarmin:
         def _login(email, password, return_on_mfa=False):
             if password == "wrong":
                 raise garmin_mcp.GarminConnectAuthenticationError("401 Unauthorized")
-            return ("needs_mfa", {"state": 1}) if _FakeGarmin.needs_mfa else (None, None)
+            return ("needs_mfa", None) if _FakeGarmin.needs_mfa else (None, None)
 
         def _dump(path):
             with open(f"{path}/garmin_tokens.json", "w") as f:
@@ -95,7 +95,7 @@ def test_login_with_mfa(setup):
     ok = client.post("/login/mfa?key=k", data={"nonce": nonce, "code": "123456"})
     assert "Kirjautuminen onnistui" in ok.text
     assert pending.login_state() == "ready"
-    assert _FakeGarmin.instances[0].resumed_with == ({"state": 1}, "123456")
+    assert _FakeGarmin.instances[0].resumed_with == (None, "123456")
     assert nonce not in web_login._pending_mfa
 
 
