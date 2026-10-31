@@ -7,36 +7,46 @@ Tämä repo on kopio projektista [taxuspt/garmin_mcp](https://github.com/taxuspt
   ja kuuntelee Railwayn antamaa `$PORT`-porttia.
 - `MCP_AUTH_TOKEN` suojaa endpointin: pyynnöissä pitää olla
   `Authorization: Bearer <token>` tai `?key=<token>` URL:ssa.
-- `GARMIN_TOKENS_BASE64` antaa Garmin-tokenit ympäristömuuttujana, koska
-  Railwayssä ei voi syöttää MFA-koodia interaktiivisesti.
+- **Kirjautumissivu `/login`**: kirjaudut Garmin-tilillesi selaimessa
+  (sähköposti, salasana ja MFA-koodi). Mitään ei tarvitse ajaa omalla koneella.
+- MCP-työkalu `garmin_login_status` kertoo, onko palvelin kirjautunut, ja antaa
+  kirjautumissivun osoitteen.
 - `railway.json` määrittää Dockerfile-buildin ja `/healthz`-healthcheckin.
 
-## 1. Luo Garmin-tokenit omalla koneellasi
+## 1. Railwayn asetukset
 
-```bash
-uvx --python 3.12 --from git+https://github.com/OJHela/Garmin-mcp garmin-mcp-auth
-cat ~/.garminconnect_base64
-```
-
-Kopioi tulostettu merkkijono talteen. Tokenit ovat voimassa noin 6 kuukautta.
-
-## 2. Luo palvelu Railwayssä
-
-1. Railway → **New Project → Deploy from GitHub repo** → valitse `OJHela/Garmin-mcp`.
-2. **Variables**-välilehdelle:
+1. **Variables**-välilehdelle:
 
    | Muuttuja | Arvo |
    |---|---|
-   | `GARMIN_TOKENS_BASE64` | kohdan 1 merkkijono |
    | `MCP_AUTH_TOKEN` | pitkä satunnainen salasana, esim. `openssl rand -hex 32` |
    | `GARMIN_ENABLED_TOOLS` | *(valinnainen)* pilkuilla eroteltu lista työkaluista |
 
-3. **Settings → Networking → Generate Domain**.
-4. (Suositeltu) Lisää **Volume** polkuun `/root/.garminconnect`, jotta päivitetyt
-   tokenit säilyvät uudelleenkäynnistysten yli.
+2. **Settings → Networking → Generate Domain**.
+3. **Volume** polkuun `/root/.garminconnect` (oikealla klikkaus palvelun
+   kohdalla → *Attach Volume*). Tokenit tallentuvat sinne ja säilyvät
+   uudelleenkäynnistysten ja uusien deployjen yli.
 
-Tarkista että palvelu on ylhäällä: `https://<domain>/readyz` palauttaa
-`{"status": "ready"}`, kun Garmin-kirjautuminen onnistui.
+## 2. Kirjaudu Garminiin
+
+Avaa selaimessa:
+
+```
+https://<domain>/login?key=<MCP_AUTH_TOKEN>
+```
+
+Syötä Garmin-sähköposti ja salasana, ja sen jälkeen vahvistuskoodi, jos Garmin
+pyytää sitä. Onnistuneen kirjautumisen jälkeen MCP-työkalut toimivat heti, eikä
+palvelua tarvitse käynnistää uudelleen. Salasanaa ei tallenneta, vain
+kirjautumistokenit, jotka ovat voimassa noin 6 kuukautta. Kun ne vanhenevat,
+kirjaudu samalla sivulla uudelleen.
+
+`https://<domain>/readyz` palauttaa `{"status": "ready"}`, kun kirjautuminen on
+voimassa.
+
+**Ilman Volumea** tokenit katoavat jokaisessa uudelleenkäynnistyksessä. Silloin
+kopioi onnistumissivun kohta *Näytä GARMIN_TOKENS_BASE64* Railwayn muuttujaan
+`GARMIN_TOKENS_BASE64`, niin palvelin kirjautuu sillä käynnistyessään.
 
 ## 3. Yhdistä MCP-asiakas
 
@@ -50,4 +60,14 @@ MCP-endpoint: `https://<domain>/mcp`
     --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
   ```
 
-Pidä `MCP_AUTH_TOKEN` salassa — sillä pääsee lukemaan ja muokkaamaan Garmin-tiliäsi.
+Pidä `MCP_AUTH_TOKEN` salassa — sillä pääsee lukemaan ja muokkaamaan
+Garmin-tiliäsi ja vaihtamaan palvelimen kirjautuneen tilin.
+
+## Vaihtoehto: tokenit omalta koneelta
+
+```bash
+uvx --python 3.12 --from git+https://github.com/OJHela/Garmin-mcp garmin-mcp-auth
+cat ~/.garminconnect_base64
+```
+
+Liitä tulostettu merkkijono Railwayn muuttujaan `GARMIN_TOKENS_BASE64`.
