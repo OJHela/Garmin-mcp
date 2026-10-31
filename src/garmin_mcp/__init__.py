@@ -348,7 +348,8 @@ class _PendingGarminClient:
                 if client is None:
                     self._login_error = RuntimeError(
                         "Garmin login failed. Run 'garmin-mcp-auth' to "
-                        "authenticate, then restart the server."
+                        "authenticate, then restart the server. On a hosted "
+                        "server, log in from the /login page instead."
                     )
                     print(
                         "Garmin Connect client failed to initialize (see "
@@ -367,6 +368,16 @@ class _PendingGarminClient:
 
         threading.Thread(target=_worker, name="garmin-login", daemon=True).start()
         return self
+
+    def set_client(self, client):
+        """Replace the client after a later login (e.g. the ``/login`` page).
+
+        Clears any startup login error, so tool calls succeed from now on
+        without a server restart.
+        """
+        self._client = client
+        self._login_error = None
+        self._ready.set()
 
     def login_state(self):
         """Non-blocking login status: ``"pending"``, ``"ready"`` or ``"failed"``.
@@ -493,11 +504,12 @@ class _ToolFilter:
             name = explicit or getattr(fn, "__name__", "")
             self._seen.add(name.lower())
             if self._allowed(name):
-                annotations = annotations_for(name)
-                if annotations is None:
-                    self._unannotated.add(name)
-                else:
-                    kwargs.setdefault("annotations", annotations)
+                if "annotations" not in kwargs:
+                    annotations = annotations_for(name)
+                    if annotations is None:
+                        self._unannotated.add(name)
+                    else:
+                        kwargs["annotations"] = annotations
                 decorator = self._app.tool(*args, **kwargs)
                 return decorator(fn)
             return fn  # skip registration; tool never reaches the LLM
@@ -840,6 +852,39 @@ def main():
             file=sys.stderr,
         )
 
+    auth_token = os.getenv("MCP_AUTH_TOKEN", "").strip()
+
+    from mcp.types import ToolAnnotations
+
+    @app.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+    async def garmin_login_status() -> str:
+        """Report whether the server is logged in to Garmin Connect.
+
+        If it is not, the user can log in from the server's /login page in a
+        browser (append ?key=<MCP_AUTH_TOKEN>). Never ask the user for their
+        Garmin password in chat; send them to that page instead.
+        """
+        import json
+
+        public_url = os.getenv("GARMIN_MCP_PUBLIC_URL", "").rstrip("/")
+        if not public_url and os.getenv("RAILWAY_PUBLIC_DOMAIN"):
+            public_url = "https://" + os.getenv("RAILWAY_PUBLIC_DOMAIN")
+        login_available = transport != "stdio" and bool(auth_token)
+        return json.dumps({
+            "status": pending_client.login_state(),
+            "login_url": (
+                f"{public_url}/login?key=<MCP_AUTH_TOKEN>"
+                if login_available and public_url
+                else "/login?key=<MCP_AUTH_TOKEN>" if login_available else None
+            ),
+            "hint": (
+                "Open login_url in a browser and enter your Garmin email, "
+                "password and MFA code there."
+                if login_available
+                else "Run 'garmin-mcp-auth' on this machine and restart the server."
+            ),
+        })
+
     # When serving over HTTP, expose liveness/readiness endpoints for k8s probes.
     # The MCP endpoint itself requires a handshake and isn't probe-friendly.
     if transport != "stdio":
@@ -857,6 +902,14 @@ def main():
             status_code, body = _readiness(pending_client)
             return JSONResponse(body, status_code=status_code)
 
+        # Browser login page. Only with MCP_AUTH_TOKEN: without it anyone who
+        # can reach the server could replace the Garmin account behind it.
+        if auth_token:
+            from garmin_mcp import web_login
+
+            web_login.register_login_routes(fastmcp, pending_client, tokenstore, is_cn)
+            print("Garmin login page available at /login?key=<MCP_AUTH_TOKEN>.", file=sys.stderr)
+
         mode = " (stateless)" if stateless_http and transport == "streamable-http" else ""
         print(
             f"Serving MCP over {transport}{mode} on {http_host}:{http_port}",
@@ -865,7 +918,6 @@ def main():
 
     # Run the MCP server. With MCP_AUTH_TOKEN set, HTTP transports are served
     # through a bearer-token check so the endpoint can be exposed publicly.
-    auth_token = os.getenv("MCP_AUTH_TOKEN", "").strip()
     if transport != "stdio" and auth_token:
         import uvicorn
 
@@ -880,6 +932,8 @@ def main():
             host=http_host,
             port=http_port,
             log_level="info",
+            # Access logs would print ?key=<MCP_AUTH_TOKEN> into platform logs.
+            access_log=False,
         )
         return
     if transport != "stdio" and http_host not in ("127.0.0.1", "localhost", "::1"):
