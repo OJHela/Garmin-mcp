@@ -112,3 +112,68 @@ def test_unknown_mfa_nonce(setup):
     resp = client.post("/login/mfa?key=k", data={"nonce": "nope", "code": "123456"})
     assert resp.status_code == 400
     assert "vanheni" in resp.text
+
+
+# --- MCP login tools --------------------------------------------------------
+
+
+@pytest.fixture
+def tools(tmp_path, monkeypatch):
+    _FakeGarmin.needs_mfa = False
+    _FakeGarmin.instances = []
+    web_login._pending_mfa.clear()
+    monkeypatch.setattr(web_login, "Garmin", _FakeGarmin)
+    pending = garmin_mcp._PendingGarminClient(timeout=1.0)
+    pending.start(lambda: None)
+    pending._ready.wait(1.0)
+    app = FastMCP("test")
+    web_login.register_login_tools(app, pending, str(tmp_path / "tokens"), is_cn=False)
+
+    async def call(name, args=None):
+        result = await app.call_tool(name, args or {})
+        content = result[0] if isinstance(result, tuple) else result
+        return json.loads(content[0].text)
+
+    return call, pending
+
+
+async def test_tool_status_not_logged_in(tools):
+    call, _ = tools
+    assert (await call("garmin_login_status"))["status"] == "not_logged_in"
+
+
+async def test_tool_login_without_mfa(tools):
+    call, pending = tools
+    result = await call("garmin_login", {"email": "a@b.c", "password": "pw"})
+    assert result["status"] == "ready"
+    assert pending.login_state() == "ready"
+    assert (await call("garmin_login_status"))["status"] == "ready"
+
+
+async def test_tool_login_with_mfa(tools):
+    call, pending = tools
+    _FakeGarmin.needs_mfa = True
+    result = await call("garmin_login", {"email": "a@b.c", "password": "pw"})
+    assert result["status"] == "needs_mfa"
+    bad = await call("garmin_submit_mfa_code", {"code": "000000"})
+    assert bad["status"] == "error"
+    assert pending.login_state() == "failed"
+    ok = await call("garmin_submit_mfa_code", {"code": "123456"})
+    assert ok["status"] == "ready"
+    assert pending.login_state() == "ready"
+    # The pending login is consumed.
+    again = await call("garmin_submit_mfa_code", {"code": "123456"})
+    assert again["status"] == "error"
+
+
+async def test_tool_login_wrong_password(tools):
+    call, pending = tools
+    result = await call("garmin_login", {"email": "a@b.c", "password": "wrong"})
+    assert result["status"] == "error"
+    assert pending.login_state() == "failed"
+
+
+async def test_tool_mfa_without_login(tools):
+    call, _ = tools
+    result = await call("garmin_submit_mfa_code", {"code": "123456"})
+    assert result["status"] == "error"
