@@ -347,8 +347,8 @@ def register_oauth_routes(fastmcp, provider, is_cn):
         if not email or not password:
             return _login_form(request_id, "Anna sähköposti ja salasana.")
         try:
-            garmin, client_state = await run_in_threadpool(start_login, email, password, is_cn)
-            if client_state is not None:
+            garmin, needs_mfa, client_state = await run_in_threadpool(start_login, email, password, is_cn)
+            if needs_mfa:
                 pending["garmin"] = garmin
                 pending["mfa_state"] = client_state
                 return _mfa_form(request_id)

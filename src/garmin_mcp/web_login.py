@@ -141,14 +141,14 @@ def _error_text(err):
 
 
 def start_login(email, password, is_cn):
-    """Exchange credentials. Returns ``(garmin, client_state or None)``.
+    """Exchange credentials. Returns ``(garmin, needs_mfa, client_state)``.
 
-    ``client_state`` is set when Garmin wants an MFA code; pass it with the
-    code to ``garmin.resume_login``.
+    When ``needs_mfa`` is true, pass ``client_state`` (which garminconnect
+    may leave as ``None``) with the user's code to ``garmin.resume_login``.
     """
     garmin = Garmin(email=email, password=password, is_cn=is_cn, return_on_mfa=True)
     result1, result2 = garmin.client.login(email, password, return_on_mfa=True)
-    return garmin, (result2 if result1 == "needs_mfa" else None)
+    return garmin, result1 == "needs_mfa", result2
 
 
 def finish_login(garmin, pending_client, tokenstore, is_cn):
@@ -189,8 +189,8 @@ def register_login_routes(fastmcp, pending_client, tokenstore, is_cn):
             return _credentials_form(request, state, "Anna sähköposti ja salasana.")
 
         try:
-            garmin, client_state = await run_in_threadpool(start_login, email, password, is_cn)
-            if client_state is not None:
+            garmin, needs_mfa, client_state = await run_in_threadpool(start_login, email, password, is_cn)
+            if needs_mfa:
                 _prune_expired()
                 nonce = secrets.token_urlsafe(24)
                 with _pending_lock:
@@ -282,8 +282,8 @@ def register_login_tools(app, pending_client, tokenstore, is_cn):
         if not email or not password:
             return _result("error", "Email and password are required.")
         try:
-            garmin, client_state = await run_in_threadpool(start_login, email, password, is_cn)
-            if client_state is not None:
+            garmin, needs_mfa, client_state = await run_in_threadpool(start_login, email, password, is_cn)
+            if needs_mfa:
                 _prune_expired()
                 with _pending_lock:
                     _pending_mfa[_TOOL_MFA_KEY] = (
